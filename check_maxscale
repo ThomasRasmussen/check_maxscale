@@ -1,0 +1,354 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+###############################################################################
+#           THIS FILE IS MANAGED BY Puppet - DO NOT EDIT MANUALLY!!           #
+###############################################################################
+#
+# Author:  Fabien Hochstrasser <fabien.hochstrasser@swisscom.com>
+# Date:    2018-04-03
+# Purpose: Nagios check to monitor the MaxScale SQL proxy.
+#
+# This script uses the maxadmin CLI to read the status of MaxScale.
+#
+# Usage: see --help
+#
+import argparse
+import os
+import subprocess
+import sys
+
+from collections import namedtuple
+
+Server = namedtuple('Server', 'name address port connections status')
+Session = namedtuple('Session', 'id client service state')
+Monitor = namedtuple('Monitor', 'name status')
+Problem = namedtuple('Problem', 'message severity')
+
+OK = 0
+WARNING = 1
+CRITICAL = 2
+UNKNOWN = 3
+
+
+def main(args):
+    servers = []
+    sessions = []
+    monitors = []
+    problems = []
+
+    try:
+        servers = maxadmin_list_servers()
+        sessions = maxadmin_list_sessions()
+        monitors = maxadmin_list_monitors()
+    except subprocess.CalledProcessError:
+        problems.append(Problem(
+            message='MaxScale doesn\'t seem to be running',
+            severity=CRITICAL,
+        ))
+
+    problems.extend(
+        check_servers(servers, args.expected_number_of_servers, args.connections_threshold) + \
+        check_sessions(sessions, args.sessions_threshold) + \
+        check_monitors(monitors)
+    )
+
+    if args.verbose:
+        print('Servers')
+        for server in servers:
+            print(server)
+        print('')
+        print('Sessions')
+        for session in sessions:
+            print(session)
+        print('')
+        print('Monitors')
+        for monitor in monitors:
+            print(monitor)
+        print('')
+        print('Problems')
+        for problem in problems:
+            print problem
+
+    print_message(problems)
+    sys.exit(
+        CRITICAL if any([p.severity == CRITICAL for p in problems])
+        else WARNING if any([p.severity == WARNING for p in problems])
+        else OK
+    )
+
+
+def maxadmin_list_servers():
+    """Return the servers known to MaxScale.
+
+    The command 'maxadmin list servers' is used.
+    """
+    servers = []
+
+    devnull = open(os.devnull, 'w')
+    for line in subprocess.check_output(
+        ['maxadmin', 'list', 'servers'],
+        stderr=devnull,
+        close_fds=True,
+    ).split('\n'):
+        try:
+            fields = [field.strip() for field in line.split('|')]
+            servers.append(Server(
+                name=fields[0],
+                address=fields[1],
+                port=int(fields[2]),
+                connections=int(fields[3]),
+                status={s.strip() for s in fields[4].split(',')},
+            ))
+        except (ValueError, IndexError):
+            # If the line cannot be parsed, just ignore it. It's a header line.
+            pass
+
+    return servers
+
+
+def maxadmin_list_sessions():
+    """Return the sessions established to MaxScale.
+
+    The command 'maxadmin list sessions' is used.
+    """
+    sessions = []
+
+    devnull = open(os.devnull, 'w')
+    for line in subprocess.check_output(
+        ['maxadmin', 'list', 'sessions'],
+        stderr=devnull,
+        close_fds=True,
+    ).split('\n'):
+        try:
+            fields = [field.strip() for field in line.split('|')]
+            sessions.append(Session(
+                id=int(fields[0]),
+                client=fields[1],
+                service=fields[2],
+                state=fields[3],
+            ))
+        except (ValueError, IndexError):
+            # If the line cannot be parsed, just ignore it. It's a header line.
+            pass
+
+    return sessions
+
+
+def maxadmin_list_monitors():
+    """Return the monitors configured in MaxScale.
+
+    The command 'maxadmin list monitors' is used.
+    """
+    monitors = []
+
+    devnull = open(os.devnull, 'w')
+    for line in subprocess.check_output(
+        ['maxadmin', 'list', 'monitors'],
+        stderr=devnull,
+        close_fds=True,
+    ).split('\n'):
+        try:
+            fields = [field.strip() for field in line.split('|')]
+            # Ignore the header line
+            if fields[1] != 'Status':
+                monitors.append(Monitor(
+                    name=fields[0],
+                    status=fields[1],
+                ))
+        except (ValueError, IndexError):
+            # If the line cannot be parsed, just ignore it. It's a header line.
+            pass
+
+    return monitors
+
+
+def check_servers(servers, expected_number_of_servers, connections_threshold):
+    problems = []
+    problems.append(check_servers_count(len(servers), expected_number_of_servers))
+    problems.append(check_servers_no_master(servers))
+
+    for server in servers:
+        problems.append(check_server_status(server))
+        problems.append(check_server_connections(server, connections_threshold))
+
+    return [p for p in problems if p is not None]
+
+
+def check_servers_count(real, expected):
+     """Return a problem if the number of backend servers is different than expected."""
+     if real == 0:
+         return Problem(
+             message='Could not find any backend server',
+             severity=CRITICAL,
+         )
+     if real != expected:
+         return Problem(
+             message='{real} backend servers detected (expected {expected})'.format(
+                 real=real,
+                 expected=expected,
+             ),
+             severity=WARNING,
+         )
+
+
+def check_servers_no_master(servers):
+    """Return a problem if no backend server has the status "Master"."""
+    if not any(['Master' in s.status for s in servers]):
+        return Problem(
+            message='No backend server in Master mode',
+            severity=CRITICAL,
+        )
+
+    return None
+
+
+def check_server_status(server):
+    """Return a problem if the server status isn't "normal"."""
+    if 'Maintenance' in server.status:
+        return Problem(
+            message='Server "{0}" in Maintenance mode'.format(server.name),
+            severity=WARNING,
+        )
+
+    if 'Down' in server.status:
+        return Problem(
+            message='Server "{0}" down'.format(server.name),
+            severity=WARNING,
+        )
+
+    if 'Synced' not in server.status:
+        return Problem(
+            message='Server "{0}" not Synced'.format(server.name),
+            severity=CRITICAL,
+        )
+
+    return None
+
+
+def check_server_connections(server, connections_threshold):
+    """Return a problem if the number of connections on a server isn't "normal"."""
+    if server.connections > connections_threshold:
+        return Problem(
+            message='Server "{0}" has more than {1} connections'.format(
+                server.name,
+                connections_threshold,
+            ),
+            severity=WARNING,
+        )
+
+    return None
+
+
+def check_sessions(sessions, sessions_threshold):
+    problems = []
+
+    problems.append(check_sessions_count(len(sessions), sessions_threshold))
+    problems.append(check_sessions_unique_id(sessions))
+
+    return [p for p in problems if p is not None]
+
+
+def check_sessions_count(real, max):
+    """Return a problem if the number of sessions is outside the "normal" range."""
+    if real > max:
+        return Problem(
+            message='{real} sessions detected (max {max})'.format(
+                real=real,
+                max=max,
+            ),
+            severity=WARNING,
+        )
+
+    return None
+
+
+def check_sessions_unique_id(sessions):
+    """Alert if 2 sessions have the same ID.
+
+    From MaxScale documentation:
+    The sessions are referenced using ID values, these are actually memory address,
+    however the important thing is that no two session have the same ID.
+    """
+    # Compare list and set sizes. If they differ, there are duplicates
+    if len([s.id for s in sessions]) != len({s.id for s in sessions}):
+        return Problem(
+            message='Some sessions have the same ID',
+            severity=WARNING,
+        )
+
+    return None
+
+
+def check_monitors(monitors):
+    problems = []
+
+    for monitor in monitors:
+        problems.append(check_monitor_status(monitor))
+
+    return [p for p in problems if p is not None]
+
+
+def check_monitor_status(monitor):
+    """Alert if the status of a monitor isn't 'Running'."""
+    if monitor.status != 'Running':
+        return Problem(
+            message='Status of monitor "{0}": {1}'.format(monitor.name, monitor.status),
+            severity=WARNING,
+        )
+
+    return None
+
+
+def print_message(problems):
+    problems_critical = [p for p in problems if p.severity == CRITICAL]
+    problems_warning = [p for p in problems if p.severity == WARNING]
+
+    if problems_critical:
+        print('CRITICAL - {0}'.format(', '.join([p.message for p in problems_critical])))
+    elif problems_warning:
+        print('WARNING - {0}'.format(', '.join([p.message for p in problems_warning])))
+    else:
+        print('OK - No problem detected on MaxScale')
+
+
+# Those thresholds are just a guess, they are maybe way to low/high...
+DEFAULT_CONNECTIONS_THRESHOLD = 500
+DEFAULT_SESSIONS_THRESHOLD = 1000
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(
+        description='Nagios check to monitor the MaxScale SQL proxy.',
+    )
+    parser.add_argument(
+        '--expected-number-of-servers', '-n',
+        required=True,
+        type=int,
+        help='Expected number of backend server',
+    )
+    parser.add_argument(
+        '--connections-threshold',
+        type=int,
+        default=DEFAULT_CONNECTIONS_THRESHOLD,
+        help=(
+            'Alert if a server has more connections than this threshold '
+            '(default {0})'.format(DEFAULT_CONNECTIONS_THRESHOLD)
+        ),
+    )
+    parser.add_argument(
+        '--sessions-threshold',
+        type=int,
+        default=DEFAULT_SESSIONS_THRESHOLD,
+        help=(
+            'Alert if there are more sessions than this threshold '
+            '(default {0})'.format(DEFAULT_SESSIONS_THRESHOLD)
+        ),
+    )
+    parser.add_argument(
+        '--verbose', '-v',
+        action='store_true',
+        help='Print detailed information',
+    )
+    args = parser.parse_args()
+
+    main(args)
