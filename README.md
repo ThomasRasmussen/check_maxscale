@@ -1,3 +1,5 @@
+# Usage
+```
 usage: check_maxscale [-h] [--cli CLI] --expected-number-of-servers
                       EXPECTED_NUMBER_OF_SERVERS
                       [--expected-master EXPECTED_MASTER]
@@ -21,3 +23,4 @@ optional arguments:
                         Alert if there are more sessions than this threshold
                         (default 1000)
   --verbose, -v         Print detailed information
+```
