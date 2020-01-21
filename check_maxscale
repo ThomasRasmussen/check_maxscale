@@ -5,7 +5,7 @@
 # Date:    2018-04-03
 # Purpose: Nagios check to monitor the MaxScale SQL proxy.
 #
-# This script uses the maxadmin CLI to read the status of MaxScale.
+# This script uses the maxadmin/maxctrl CLI to read the status of MaxScale.
 #
 # Usage: see --help
 #
@@ -20,6 +20,7 @@ Server = namedtuple('Server', 'name address port connections status')
 Session = namedtuple('Session', 'id client service state')
 Monitor = namedtuple('Monitor', 'name status')
 Problem = namedtuple('Problem', 'message severity')
+cli = {} 
 
 OK = 0
 WARNING = 1
@@ -33,6 +34,15 @@ def main(args):
     monitors = []
     problems = []
 
+    cli['name'] = args.cli
+    if (cli['name'] == 'maxadmin'):
+       cli['option'] = ''
+       cli['fieldseparator'] = '|'
+    elif (cli['name'] == 'maxctrl'):
+       cli['option'] = '--tsv'
+       cli['fieldseparator'] = '\t'
+
+
     try:
         servers = maxadmin_list_servers()
         sessions = maxadmin_list_sessions()
@@ -44,7 +54,7 @@ def main(args):
         ))
 
     problems.extend(
-        check_servers(servers, args.expected_number_of_servers, args.connections_threshold) + \
+        check_servers(servers, args.expected_number_of_servers, args.connections_threshold, args.expected_master) + \
         check_sessions(sessions, args.sessions_threshold) + \
         check_monitors(monitors)
     )
@@ -77,18 +87,18 @@ def main(args):
 def maxadmin_list_servers():
     """Return the servers known to MaxScale.
 
-    The command 'maxadmin list servers' is used.
+    The maxscale cli command 'list servers' is used.
     """
     servers = []
 
     devnull = open(os.devnull, 'w')
     for line in subprocess.check_output(
-        ['maxadmin', 'list', 'servers'],
+        [cli['name'], 'list', 'servers', cli['option']],
         stderr=devnull,
         close_fds=True,
     ).split('\n'):
         try:
-            fields = [field.strip() for field in line.split('|')]
+            fields = [field.strip() for field in line.split(cli['fieldseparator'])]
             servers.append(Server(
                 name=fields[0],
                 address=fields[1],
@@ -106,20 +116,20 @@ def maxadmin_list_servers():
 def maxadmin_list_sessions():
     """Return the sessions established to MaxScale.
 
-    The command 'maxadmin list sessions' is used.
+    The maxscale cli command 'list sessions' is used.
     """
     sessions = []
 
     devnull = open(os.devnull, 'w')
     for line in subprocess.check_output(
-        ['maxadmin', 'list', 'sessions'],
+        [cli['name'], 'list', 'sessions', cli['option']],
         stderr=devnull,
         close_fds=True,
     ).split('\n'):
         try:
-            fields = [field.strip() for field in line.split('|')]
+            fields = [field.strip() for field in line.split(cli['fieldseparator'])]
             sessions.append(Session(
-                id=int(fields[0]),
+                id=fields[0],
                 client=fields[1],
                 service=fields[2],
                 state=fields[3],
@@ -134,18 +144,18 @@ def maxadmin_list_sessions():
 def maxadmin_list_monitors():
     """Return the monitors configured in MaxScale.
 
-    The command 'maxadmin list monitors' is used.
+    The maxscale cli command 'list monitors' is used.
     """
     monitors = []
 
     devnull = open(os.devnull, 'w')
     for line in subprocess.check_output(
-        ['maxadmin', 'list', 'monitors'],
+        [cli['name'], 'list', 'monitors', cli['option']],
         stderr=devnull,
         close_fds=True,
     ).split('\n'):
         try:
-            fields = [field.strip() for field in line.split('|')]
+            fields = [field.strip() for field in line.split(cli['fieldseparator'])]
             # Ignore the header line
             if fields[1] != 'Status':
                 monitors.append(Monitor(
@@ -159,7 +169,7 @@ def maxadmin_list_monitors():
     return monitors
 
 
-def check_servers(servers, expected_number_of_servers, connections_threshold):
+def check_servers(servers, expected_number_of_servers, connections_threshold, expected_master):
     problems = []
     problems.append(check_servers_count(len(servers), expected_number_of_servers))
     problems.append(check_servers_no_master(servers))
@@ -167,6 +177,8 @@ def check_servers(servers, expected_number_of_servers, connections_threshold):
     for server in servers:
         problems.append(check_server_status(server))
         problems.append(check_server_connections(server, connections_threshold))
+        if (expected_master and 'Master' in server.status):
+		problems.append(check_master(server, expected_master))
 
     return [p for p in problems if p is not None]
 
@@ -194,6 +206,17 @@ def check_servers_no_master(servers):
         return Problem(
             message='No backend server in Master mode',
             severity=CRITICAL,
+        )
+
+    return None
+
+
+def check_master(server,expected_master):
+    """Return a problem if expected master backend server is not the master."""
+    if (server.name != expected_master):
+        return Problem(
+            message='Server {0} is not the expected master {1}'.format(server.name,expected_master),
+            severity=WARNING,
         )
 
     return None
@@ -308,6 +331,9 @@ def print_message(problems):
         print('OK - No problem detected on MaxScale')
 
 
+# Default cli command
+DEFAULT_CLI_COMMAND = 'maxadmin'
+
 # Those thresholds are just a guess, they are maybe way to low/high...
 DEFAULT_CONNECTIONS_THRESHOLD = 500
 DEFAULT_SESSIONS_THRESHOLD = 1000
@@ -318,13 +344,25 @@ if __name__ == '__main__':
         description='Nagios check to monitor the MaxScale SQL proxy.',
     )
     parser.add_argument(
+        '--cli', '-i',
+        default=DEFAULT_CLI_COMMAND,
+        help=(
+            'CLI command we should use (maxadmin/maxctrl) '
+            '(default {0})'.format(DEFAULT_CLI_COMMAND)
+        ),
+    )
+    parser.add_argument(
         '--expected-number-of-servers', '-n',
         required=True,
         type=int,
         help='Expected number of backend server',
     )
     parser.add_argument(
-        '--connections-threshold',
+        '--expected-master', '-m',
+        help='Expected backend master server',
+    )
+    parser.add_argument(
+        '--connections-threshold', '-c',
         type=int,
         default=DEFAULT_CONNECTIONS_THRESHOLD,
         help=(
@@ -333,7 +371,7 @@ if __name__ == '__main__':
         ),
     )
     parser.add_argument(
-        '--sessions-threshold',
+        '--sessions-threshold', '-s',
         type=int,
         default=DEFAULT_SESSIONS_THRESHOLD,
         help=(
